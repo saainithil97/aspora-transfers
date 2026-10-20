@@ -1,0 +1,28 @@
+server:
+  port: ${PORT:8080}
+
+spring:
+  application:
+    name: transfers
+  main:
+    banner-mode: off
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://localhost:5432/transfers}
+    username: ${DATABASE_USER:transfers}
+    password: ${DATABASE_PASSWORD:transfers}
+  flyway:
+    enabled: true
+
+transfers:
+  daily-limit-minor: ${DAILY_LIMIT_MINOR:5000000}
+  dispatch-interval-ms: ${DISPATCH_INTERVAL_MS:500}
+  rail:
+    failure-rate: ${RAIL_FAILURE_RATE:0.2}
+    latency-ms: ${RAIL_LATENCY_MS:300}
+    webhook-secret: ${RAIL_WEBHOOK_SECRET:rail-dev-secret}
+    webhook-enabled: ${RAIL_WEBHOOK_ENABLED:true}
+
+logging:
+  level:
+    root: INFO
+    com.aspora.interview.transfers: INFO
