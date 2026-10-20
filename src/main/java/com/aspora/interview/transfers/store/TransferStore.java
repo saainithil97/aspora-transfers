@@ -108,22 +108,33 @@ public class TransferStore {
                 .list();
     }
 
-    public void updateStatus(UUID id, TransferStatus status) {
-        db.sql("update transfers set status = :status, updated_at = now() where id = :id")
-                .param("status", status.name())
+    /**
+     * Moves the transfer from {@code expected} to {@code next} only if it is still in {@code expected}.
+     * Returns false when another request or instance got there first. Concurrent callers queue on the row
+     * lock and Postgres re-checks the where clause, so exactly one of them wins.
+     */
+    public boolean compareAndSetStatus(UUID id, TransferStatus expected, TransferStatus next) {
+        return db.sql("update transfers set status = :next, updated_at = now() where id = :id and status = :expected")
+                .param("next", next.name())
+                .param("expected", expected.name())
                 .param("id", id)
-                .update();
+                .update() == 1;
     }
 
-    public void markFailed(UUID id, String reason) {
-        db.sql("update transfers set status = 'FAILED', failure_reason = :reason, updated_at = now() where id = :id")
+    /** As {@link #compareAndSetStatus} to FAILED, also recording why. */
+    public boolean markFailed(UUID id, TransferStatus expected, String reason) {
+        return db.sql("""
+                update transfers set status = 'FAILED', failure_reason = :reason, updated_at = now()
+                where id = :id and status = :expected
+                """)
                 .param("reason", reason)
+                .param("expected", expected.name())
                 .param("id", id)
-                .update();
+                .update() == 1;
     }
 
     public void setRailRef(UUID id, String railRef) {
-        db.sql("update transfers set rail_ref = :ref, updated_at = now() where id = :id")
+        db.sql("update transfers set rail_ref = :ref, updated_at = now() where id = :id and rail_ref is null")
                 .param("ref", railRef)
                 .param("id", id)
                 .update();

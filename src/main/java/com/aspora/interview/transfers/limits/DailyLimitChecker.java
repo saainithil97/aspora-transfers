@@ -21,7 +21,25 @@ public class DailyLimitChecker {
         this.dailyLimitMinor = props.dailyLimitMinor();
     }
 
+    /**
+     * Takes a transaction-scoped Postgres advisory lock on the user, so every instance creating a transfer
+     * for this user queues here until the holder commits. Must be called inside a transaction, before any
+     * row lock, so the lock order is always user then accounts.
+     */
+    public void lockUser(String userId) {
+        db.sql("select pg_advisory_xact_lock(hashtextextended(:userId, 0))")
+                .param("userId", userId)
+                .query()
+                .singleRow();
+    }
+
+    /**
+     * Must be called inside the transaction that inserts the transfer. Holding the user lock until commit
+     * means the next sender's sum already includes this transfer. Advisory locks are re-entrant, so callers
+     * that already hold it can call this freely.
+     */
     public void check(String userId, long amountMinor) {
+        lockUser(userId);
         long sentToday = sentToday(userId);
         if (sentToday + amountMinor > dailyLimitMinor) {
             throw new ApiException(ErrorCode.LIMIT_EXCEEDED,

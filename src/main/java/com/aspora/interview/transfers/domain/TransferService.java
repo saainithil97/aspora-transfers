@@ -9,6 +9,7 @@ import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.regex.Pattern;
+import org.springframework.dao.DuplicateKeyException;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.support.TransactionTemplate;
 
@@ -42,11 +43,7 @@ public class TransferService {
         String requestHash = RequestHash.of(request);
         Optional<Transfer> existing = transfers.findByIdempotencyKey(idempotencyKey);
         if (existing.isPresent()) {
-            if (!existing.get().requestHash().equals(requestHash)) {
-                throw new ApiException(ErrorCode.IDEMPOTENCY_MISMATCH,
-                        "Idempotency-Key " + idempotencyKey + " was already used with a different request body");
-            }
-            return new CreateResult(existing.get(), false);
+            return replay(existing.get(), idempotencyKey, requestHash);
         }
 
         validate(request);
@@ -56,16 +53,39 @@ public class TransferService {
             throw new ApiException(ErrorCode.VALIDATION, "account currency is " + source.currency());
         }
         long fee = fees.feeFor(request.type(), request.currency(), request.amountMinor());
-        dailyLimit.check(source.userId(), request.amountMinor());
 
         Transfer draft = new Transfer(UUID.randomUUID(), idempotencyKey, requestHash, request.type(), null,
                 request.fromAccountId(), request.toAccountId(), request.beneficiaryRef(), request.amountMinor(), fee,
                 request.currency(), null, null, null, null);
-        Transfer created = tx.execute(status -> switch (request.type()) {
-            case INTERNAL -> createInternal(draft);
-            case PAYOUT -> createPayout(draft);
-        });
-        return new CreateResult(created, true);
+        try {
+            return tx.execute(status -> {
+                // Serialises this user's sends across every instance until commit. A retry of the same request
+                // queues here behind the original, so look for the key again before judging funds or limit.
+                dailyLimit.lockUser(source.userId());
+                Optional<Transfer> raced = transfers.findByIdempotencyKey(idempotencyKey);
+                if (raced.isPresent()) {
+                    return replay(raced.get(), idempotencyKey, requestHash);
+                }
+                dailyLimit.check(source.userId(), request.amountMinor());
+                Transfer created = switch (request.type()) {
+                    case INTERNAL -> createInternal(draft);
+                    case PAYOUT -> createPayout(draft);
+                };
+                return new CreateResult(created, true);
+            });
+        } catch (DuplicateKeyException e) {
+            // Same key with a body for a different user (so a different user lock): the unique index decided.
+            Transfer winner = transfers.findByIdempotencyKey(idempotencyKey).orElseThrow(() -> e);
+            return replay(winner, idempotencyKey, requestHash);
+        }
+    }
+
+    private static CreateResult replay(Transfer existing, String idempotencyKey, String requestHash) {
+        if (!existing.requestHash().equals(requestHash)) {
+            throw new ApiException(ErrorCode.IDEMPOTENCY_MISMATCH,
+                    "Idempotency-Key " + idempotencyKey + " was already used with a different request body");
+        }
+        return new CreateResult(existing, false);
     }
 
     private Transfer createInternal(Transfer draft) {
@@ -105,23 +125,30 @@ public class TransferService {
         return transfers.find(draft.id()).orElseThrow();
     }
 
-    /** Hands a PENDING transfer to the dispatcher. */
-    public Transfer markDispatched(UUID id) {
-        return tx.execute(status -> {
-            Transfer t = transfers.find(id)
-                    .orElseThrow(() -> new ApiException(ErrorCode.NOT_FOUND, "no transfer " + id));
-            TransferState.assertTransition(t.status(), TransferStatus.DISPATCHED);
-            transfers.updateStatus(id, TransferStatus.DISPATCHED);
-            return withStatus(t, TransferStatus.DISPATCHED);
-        });
+    /**
+     * Claims a PENDING transfer for sending. Empty when another dispatcher (this instance or another) already
+     * claimed it: only the caller that gets a transfer back may send it to the rail. The claim is committed
+     * before the rail is called, so a crash after this point can at worst leave a DISPATCHED transfer without
+     * a rail_ref; it can never cause a second send.
+     */
+    public Optional<Transfer> claimForDispatch(UUID id) {
+        TransferState.assertTransition(TransferStatus.PENDING, TransferStatus.DISPATCHED);
+        if (!transfers.compareAndSetStatus(id, TransferStatus.PENDING, TransferStatus.DISPATCHED)) {
+            return Optional.empty();
+        }
+        return transfers.find(id);
     }
 
-    /** Fails a transfer that never reached the rail and gives the money back. */
+    /**
+     * Fails a transfer the rail refused and gives the money back. The refund happens only if this call is
+     * the one that moved the transfer to FAILED, so it cannot be applied twice.
+     */
     public void fail(Transfer t, String reason) {
         tx.executeWithoutResult(status -> {
             TransferState.assertTransition(t.status(), TransferStatus.FAILED);
-            transfers.markFailed(t.id(), reason);
-            refund(t);
+            if (transfers.markFailed(t.id(), t.status(), reason)) {
+                refund(t);
+            }
         });
     }
 

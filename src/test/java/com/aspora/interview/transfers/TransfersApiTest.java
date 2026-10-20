@@ -26,8 +26,10 @@ import org.springframework.http.MediaType;
 import org.springframework.http.RequestEntity;
 import org.springframework.http.ResponseEntity;
 import org.springframework.jdbc.core.simple.JdbcClient;
+import org.springframework.test.annotation.DirtiesContext;
 
 @RequiresPostgres
+@DirtiesContext
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
         properties = "transfers.rail.webhook-enabled=false")
 class TransfersApiTest {
@@ -40,7 +42,8 @@ class TransfersApiTest {
         @Bean
         @Primary
         RailClient alwaysAcceptingRail() {
-            return transfer -> "RR-TEST-" + counter.incrementAndGet();
+            // Unique across runs: rail_ref is unique in the database, which outlives this context.
+            return transfer -> "RR-TEST-" + counter.incrementAndGet() + "-" + UUID.randomUUID();
         }
     }
 

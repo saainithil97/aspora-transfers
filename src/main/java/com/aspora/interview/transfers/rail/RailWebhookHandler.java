@@ -44,11 +44,23 @@ public class RailWebhookHandler {
             Transfer transfer = transfers.findByRailRef(railRef)
                     .orElseThrow(() -> new ApiException(ErrorCode.NOT_FOUND, "no transfer with rail_ref " + railRef));
             partnerEvents.insert(transfer.id(), event, railRef, rawPayload);
-            transfers.updateStatus(transfer.id(), outcome);
-            if (outcome == TransferStatus.FAILED) {
-                transferService.refund(transfer);
+            // Only the delivery that moves the transfer out of DISPATCHED settles it. Rails redeliver, and with
+            // two instances two copies of one webhook can be in here at the same moment.
+            if (transfers.compareAndSetStatus(transfer.id(), TransferStatus.DISPATCHED, outcome)) {
+                if (outcome == TransferStatus.FAILED) {
+                    transferService.refund(transfer);
+                }
+                log.info("rail {} for transfer {} ({})", event, transfer.id(), railRef);
+                return;
             }
-            log.info("rail {} for transfer {} ({})", event, transfer.id(), railRef);
+            TransferStatus current = transfers.find(transfer.id()).orElseThrow().status();
+            if (current == outcome) {
+                log.info("duplicate rail {} for transfer {} ({}), already applied", event, transfer.id(), railRef);
+            } else {
+                // The rail has told us two different things. Money is left as it is; the event is kept above.
+                log.error("rail {} for transfer {} ({}) conflicts with its status {}; not applied, needs review",
+                        event, transfer.id(), railRef, current);
+            }
         });
     }
 }
