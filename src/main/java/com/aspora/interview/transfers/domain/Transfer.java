@@ -18,6 +18,7 @@ public record Transfer(
         String currency,
         String railRef,
         String failureReason,
+        String reviewReason,
         Instant createdAt,
         Instant updatedAt) {
 

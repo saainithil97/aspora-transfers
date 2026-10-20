@@ -1,6 +1,7 @@
 package com.aspora.interview.transfers.rail;
 
 import com.aspora.interview.transfers.domain.Transfer;
+import java.util.UUID;
 
 /**
  * The payout rail. Accepts a transfer for sending and returns the rail's reference for it.
@@ -10,4 +11,11 @@ import com.aspora.interview.transfers.domain.Transfer;
 public interface RailClient {
 
     String send(Transfer transfer) throws RailUnavailableException;
+
+    /**
+     * Asks the rail what became of the payment we sent with reference {@code transferId}.
+     *
+     * @throws RailUnavailableException when the rail cannot be asked right now; the answer is unknown, not NOT_FOUND
+     */
+    RailLookup status(UUID transferId) throws RailUnavailableException;
 }

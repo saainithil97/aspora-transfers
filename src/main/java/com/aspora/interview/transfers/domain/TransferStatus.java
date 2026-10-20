@@ -4,5 +4,7 @@ public enum TransferStatus {
     PENDING,
     DISPATCHED,
     COMPLETED,
-    FAILED
+    FAILED,
+    /** We could not establish what the rail did with it. Money stays debited until a human or the rail settles it. */
+    NEEDS_REVIEW
 }

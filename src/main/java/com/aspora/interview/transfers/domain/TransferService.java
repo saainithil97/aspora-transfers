@@ -1,5 +1,6 @@
 package com.aspora.interview.transfers.domain;
 
+import com.aspora.interview.transfers.config.AppProperties;
 import com.aspora.interview.transfers.fees.FeeRuleRegistry;
 import com.aspora.interview.transfers.limits.DailyLimitChecker;
 import com.aspora.interview.transfers.store.AccountStore;
@@ -22,15 +23,29 @@ public class TransferService {
     public record CreateResult(Transfer transfer, boolean created) {
     }
 
+    /** What happened when the rail's outcome was applied. */
+    public enum Settlement {
+        /** This call settled the transfer (and refunded it, if the outcome was FAILED). */
+        APPLIED,
+        /** It was already in this state: a redelivery, or the webhook and a status lookup both told us. */
+        ALREADY_APPLIED,
+        /** It is in some other state; nothing was changed. */
+        CONFLICT
+    }
+
+    public static final String RAIL_FAILED = "RAIL_REPORTED_FAILED";
+
     private final AccountStore accounts;
     private final TransferStore transfers;
     private final LedgerStore ledger;
     private final FeeRuleRegistry fees;
     private final DailyLimitChecker dailyLimit;
     private final TransactionTemplate tx;
+    private final long reconcileGraceMs;
 
     public TransferService(AccountStore accounts, TransferStore transfers, LedgerStore ledger,
-            FeeRuleRegistry fees, DailyLimitChecker dailyLimit, TransactionTemplate tx) {
+            FeeRuleRegistry fees, DailyLimitChecker dailyLimit, TransactionTemplate tx, AppProperties props) {
+        this.reconcileGraceMs = props.reconcile().graceMs();
         this.accounts = accounts;
         this.transfers = transfers;
         this.ledger = ledger;
@@ -56,7 +71,7 @@ public class TransferService {
 
         Transfer draft = new Transfer(UUID.randomUUID(), idempotencyKey, requestHash, request.type(), null,
                 request.fromAccountId(), request.toAccountId(), request.beneficiaryRef(), request.amountMinor(), fee,
-                request.currency(), null, null, null, null);
+                request.currency(), null, null, null, null, null);
         try {
             return tx.execute(status -> {
                 // Serialises this user's sends across every instance until commit. A retry of the same request
@@ -133,10 +148,44 @@ public class TransferService {
      */
     public Optional<Transfer> claimForDispatch(UUID id) {
         TransferState.assertTransition(TransferStatus.PENDING, TransferStatus.DISPATCHED);
-        if (!transfers.compareAndSetStatus(id, TransferStatus.PENDING, TransferStatus.DISPATCHED)) {
+        if (!transfers.claimForDispatch(id, reconcileGraceMs)) {
             return Optional.empty();
         }
         return transfers.find(id);
+    }
+
+    /**
+     * Applies an outcome the rail told us, by webhook or by status lookup. Whichever caller moves the transfer
+     * out of DISPATCHED / NEEDS_REVIEW is the only one that refunds, so two reports of one failure refund once.
+     */
+    public Settlement settle(UUID id, TransferStatus outcome) {
+        if (outcome != TransferStatus.COMPLETED && outcome != TransferStatus.FAILED) {
+            throw new IllegalArgumentException("not a rail outcome: " + outcome);
+        }
+        return tx.execute(status -> {
+            Transfer t = transfers.find(id)
+                    .orElseThrow(() -> new ApiException(ErrorCode.NOT_FOUND, "no transfer " + id));
+            if (TransferState.canTransition(t.status(), outcome) && transfers.settle(id, outcome, RAIL_FAILED)) {
+                if (outcome == TransferStatus.FAILED) {
+                    refund(t);
+                }
+                return Settlement.APPLIED;
+            }
+            TransferStatus current = transfers.find(id).orElseThrow().status();
+            return current == outcome ? Settlement.ALREADY_APPLIED : Settlement.CONFLICT;
+        });
+    }
+
+    /** The rail confirmed it never received this transfer: put it back for the dispatcher to send again. */
+    public boolean requeueForResend(UUID id) {
+        TransferState.assertTransition(TransferStatus.DISPATCHED, TransferStatus.PENDING);
+        return transfers.requeue(id);
+    }
+
+    /** We cannot find out what the rail did. Leaves the money where it is and puts the transfer in front of a human. */
+    public boolean markNeedsReview(UUID id, String reason) {
+        TransferState.assertTransition(TransferStatus.DISPATCHED, TransferStatus.NEEDS_REVIEW);
+        return transfers.markNeedsReview(id, reason);
     }
 
     /**
@@ -172,7 +221,7 @@ public class TransferService {
     private static Transfer withStatus(Transfer t, TransferStatus status) {
         return new Transfer(t.id(), t.idempotencyKey(), t.requestHash(), t.type(), status, t.fromAccountId(),
                 t.toAccountId(), t.beneficiaryRef(), t.amountMinor(), t.feeMinor(), t.currency(), t.railRef(),
-                t.failureReason(), t.createdAt(), t.updatedAt());
+                t.failureReason(), t.reviewReason(), t.createdAt(), t.updatedAt());
     }
 
     private static void validate(NewTransfer r) {

@@ -5,7 +5,9 @@ import static org.junit.jupiter.api.Assertions.assertNotEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.aspora.interview.transfers.dispatch.Dispatcher;
+import com.aspora.interview.transfers.domain.Transfer;
 import com.aspora.interview.transfers.rail.RailClient;
+import com.aspora.interview.transfers.rail.RailLookup;
 import com.fasterxml.jackson.databind.JsonNode;
 import java.time.Duration;
 import java.time.Instant;
@@ -42,8 +44,18 @@ class TransfersApiTest {
         @Bean
         @Primary
         RailClient alwaysAcceptingRail() {
-            // Unique across runs: rail_ref is unique in the database, which outlives this context.
-            return transfer -> "RR-TEST-" + counter.incrementAndGet() + "-" + UUID.randomUUID();
+            return new RailClient() {
+                @Override
+                public String send(Transfer transfer) {
+                    // Unique across runs: rail_ref is unique in the database, which outlives this context.
+                    return "RR-TEST-" + counter.incrementAndGet() + "-" + UUID.randomUUID();
+                }
+
+                @Override
+                public RailLookup status(UUID transferId) {
+                    return new RailLookup(RailLookup.State.PROCESSING, null);
+                }
+            };
         }
     }
 

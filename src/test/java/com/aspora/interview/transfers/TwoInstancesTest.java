@@ -4,7 +4,9 @@ import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.aspora.interview.transfers.dispatch.Dispatcher;
+import com.aspora.interview.transfers.domain.Transfer;
 import com.aspora.interview.transfers.rail.RailClient;
+import com.aspora.interview.transfers.rail.RailLookup;
 import com.aspora.interview.transfers.rail.WebhookSignature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -60,14 +62,22 @@ class TwoInstancesTest {
         @Primary
         RailClient countingRail() {
             AtomicInteger refs = new AtomicInteger();
-            return transfer -> {
-                SENDS.computeIfAbsent(transfer.id(), k -> new AtomicInteger()).incrementAndGet();
-                sleep(20);
-                if (transfer.beneficiaryRef().startsWith("BENE-CRASH")) {
-                    // Stands in for the process dying, or the connection dropping, after the rail got the request.
-                    throw new IllegalStateException("lost the rail's answer");
+            return new RailClient() {
+                @Override
+                public String send(Transfer transfer) {
+                    SENDS.computeIfAbsent(transfer.id(), k -> new AtomicInteger()).incrementAndGet();
+                    sleep(20);
+                    if (transfer.beneficiaryRef().startsWith("BENE-CRASH")) {
+                        // Stands in for the process dying, or the connection dropping, after the rail got it.
+                        throw new IllegalStateException("lost the rail's answer");
+                    }
+                    return "RR-2X-" + UUID.randomUUID().toString().substring(0, 8) + "-" + refs.incrementAndGet();
                 }
-                return "RR-2X-" + UUID.randomUUID().toString().substring(0, 8) + "-" + refs.incrementAndGet();
+
+                @Override
+                public RailLookup status(UUID transferId) {
+                    return new RailLookup(RailLookup.State.PROCESSING, null);
+                }
             };
         }
     }
@@ -112,7 +122,8 @@ class TwoInstancesTest {
                         "--transfers.rail.webhook-enabled=false",
                         "--transfers.daily-limit-minor=" + DAILY_LIMIT,
                         // Ticks are driven by the tests so both dispatchers can be fired at the same instant.
-                        "--transfers.dispatch-interval-ms=3600000");
+                        "--transfers.dispatch-interval-ms=3600000",
+                        "--transfers.reconcile.interval-ms=3600000");
     }
 
     // ---- 1. idempotency ----

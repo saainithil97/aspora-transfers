@@ -59,7 +59,9 @@ curl -s -X POST localhost:8080/transfers \
 
 Configuration is by environment variable (see `.env.example`): `DATABASE_URL`, `PORT`,
 `RAIL_FAILURE_RATE` (0.2), `RAIL_LATENCY_MS` (300), `RAIL_WEBHOOK_SECRET`, `DISPATCH_INTERVAL_MS` (500),
-`DAILY_LIMIT_MINOR` (5000000 = ₹50,000.00).
+`DAILY_LIMIT_MINOR` (5000000 = ₹50,000.00), `RAIL_WEBHOOK_DROP_RATE` (0.02), `RAIL_LOOKUP_FAILURE_RATE` (0),
+`RECONCILE_INTERVAL_MS` (5000), `RECONCILE_GRACE_MS` (30000), `RECONCILE_RETRY_MS` (30000),
+`RECONCILE_MAX_ATTEMPTS` (10), `RECONCILE_MAX_RESENDS` (3), `RECONCILE_MAX_PROCESSING_MS` (86400000).
 
 ## API
 
@@ -74,13 +76,17 @@ with codes `VALIDATION` 400, `NOT_FOUND` 404, `UNAUTHORIZED` 401, `IDEMPOTENCY_M
 | `GET` | `/accounts/{id}/ledger?limit=50&before=<ISO instant>` | ledger entries, newest first |
 | `GET` | `/accounts/{id}/transfers?limit=20&before=<ISO instant>` | transfers sent from the account, newest first |
 | `POST` | `/transfers` | header `Idempotency-Key` required. Body `{type, fromAccountId, toAccountId?, beneficiaryRef?, amountMinor, currency}`. 201 on create, 200 when replaying a key |
-| `GET` | `/transfers/{id}` | `{id, type, status, fromAccountId, toAccountId, beneficiaryRef, amountMinor, feeMinor, currency, railRef, failureReason, createdAt, updatedAt}` |
+| `GET` | `/transfers/{id}` | `{id, type, status, fromAccountId, toAccountId, beneficiaryRef, amountMinor, feeMinor, currency, railRef, failureReason, reviewReason, createdAt, updatedAt}` |
+| `GET` | `/internal/transfers?status=NEEDS_REVIEW&limit=50` | ops: transfers in a status, oldest first |
 | `POST` | `/internal/rail/webhook` | rail callback `{railRef, event}`, `X-Rail-Signature` = hex HMAC-SHA256 of the body → 204 |
 | `GET` | `/healthz` | `{"status":"ok"}` |
 
-Transfer statuses: `PENDING → DISPATCHED → COMPLETED | FAILED`, and `PENDING → FAILED`.
+Transfer statuses: `PENDING → DISPATCHED → COMPLETED | FAILED`, and `PENDING → FAILED`; also
+`DISPATCHED → PENDING` (the rail never received it, send again), `DISPATCHED → NEEDS_REVIEW` (we cannot find out)
+and `NEEDS_REVIEW → COMPLETED | FAILED`.
 INTERNAL transfers are created `COMPLETED`. PAYOUTs are created `PENDING`, the dispatcher moves them to
-`DISPATCHED` when the rail accepts them, and the rail's webhook settles them. A failed payout is refunded
+`DISPATCHED` when it hands them to the rail, and the rail's webhook settles them. Webhooks that do not arrive
+within `RECONCILE_GRACE_MS` are made up for by `dispatch/Reconciler`, which asks the rail's status API. A failed payout is refunded
 (amount + fee) to the source account with reversing ledger entries.
 
 ## Conventions

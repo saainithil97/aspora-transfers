@@ -1,5 +1,6 @@
 package com.aspora.interview.transfers.store;
 
+import java.sql.Types;
 import java.util.UUID;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Repository;
@@ -21,7 +22,7 @@ public class PartnerEventStore {
                 """)
                 .param("transfer", transferId)
                 .param("event", eventType)
-                .param("ref", railRef)
+                .param("ref", railRef, Types.VARCHAR)
                 .param("payload", payloadJson)
                 .update();
     }

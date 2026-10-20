@@ -19,8 +19,13 @@ public class TransferStore {
 
     private static final String COLUMNS = """
             id, idempotency_key, request_hash, type, status, from_account_id, to_account_id, beneficiary_ref,
-            amount_minor, fee_minor, currency, rail_ref, failure_reason, created_at, updated_at
+            amount_minor, fee_minor, currency, rail_ref, failure_reason, review_reason, created_at, updated_at
             """;
+
+    /** A DISPATCHED transfer the reconciler has claimed, with what it needs to decide. */
+    public record ReconcileCandidate(UUID id, String railRef, int dispatchAttempts, int checkAttempts,
+            Instant dispatchedAt) {
+    }
 
     private static final RowMapper<Transfer> ROW = (rs, i) -> new Transfer(
             rs.getObject("id", UUID.class),
@@ -36,6 +41,7 @@ public class TransferStore {
             rs.getString("currency"),
             rs.getString("rail_ref"),
             rs.getString("failure_reason"),
+            rs.getString("review_reason"),
             rs.getObject("created_at", OffsetDateTime.class).toInstant(),
             rs.getObject("updated_at", OffsetDateTime.class).toInstant());
 
@@ -101,6 +107,14 @@ public class TransferStore {
                 .list();
     }
 
+    public List<Transfer> listByStatus(TransferStatus status, int limit) {
+        return db.sql("select " + COLUMNS + " from transfers where status = :status order by updated_at limit :limit")
+                .param("status", status.name())
+                .param("limit", limit)
+                .query(ROW)
+                .list();
+    }
+
     public List<UUID> pendingIds(int limit) {
         return db.sql("select id from transfers where status = 'PENDING' order by created_at limit :limit")
                 .param("limit", limit)
@@ -117,6 +131,92 @@ public class TransferStore {
         return db.sql("update transfers set status = :next, updated_at = now() where id = :id and status = :expected")
                 .param("next", next.name())
                 .param("expected", expected.name())
+                .param("id", id)
+                .update() == 1;
+    }
+
+    /**
+     * PENDING to DISPATCHED, as {@link #compareAndSetStatus}, and starts the clock for the reconciler: the
+     * first status lookup is due {@code graceMs} from now, if no webhook has settled it by then.
+     */
+    public boolean claimForDispatch(UUID id, long graceMs) {
+        return db.sql("""
+                update transfers
+                set status = 'DISPATCHED', dispatched_at = now(), dispatch_attempts = dispatch_attempts + 1,
+                    next_check_at = now() + make_interval(secs => :grace / 1000.0), check_attempts = 0,
+                    updated_at = now()
+                where id = :id and status = 'PENDING'
+                """)
+                .param("grace", graceMs)
+                .param("id", id)
+                .update() == 1;
+    }
+
+    /**
+     * Claims up to {@code limit} DISPATCHED transfers whose next check is due. Pushing next_check_at forward
+     * (exponential backoff from {@code retryMs}) is both the schedule for the next attempt and a lease: no
+     * other instance sees these rows as due while this one is asking the rail. SKIP LOCKED lets two instances
+     * claim side by side without waiting on each other.
+     */
+    public List<ReconcileCandidate> claimDueForReconcile(int limit, long retryMs) {
+        return db.sql("""
+                update transfers t
+                set next_check_at = now() + make_interval(secs => :retry / 1000.0 * power(2, least(t.check_attempts, 6))),
+                    check_attempts = t.check_attempts + 1
+                where t.id in (
+                    select id from transfers
+                    where status = 'DISPATCHED' and next_check_at <= now()
+                    order by next_check_at
+                    limit :limit
+                    for update skip locked)
+                returning t.id, t.rail_ref, t.dispatch_attempts, t.check_attempts, t.dispatched_at
+                """)
+                .param("retry", retryMs)
+                .param("limit", limit)
+                .query((rs, i) -> new ReconcileCandidate(
+                        rs.getObject("id", UUID.class),
+                        rs.getString("rail_ref"),
+                        rs.getInt("dispatch_attempts"),
+                        rs.getInt("check_attempts"),
+                        rs.getObject("dispatched_at", OffsetDateTime.class).toInstant()))
+                .list();
+    }
+
+    /**
+     * Applies the rail's outcome if the transfer is still waiting on one (DISPATCHED, or NEEDS_REVIEW when the
+     * answer arrives after we gave up). One statement, so a webhook and the reconciler cannot both win.
+     */
+    public boolean settle(UUID id, TransferStatus outcome, String failureReason) {
+        return db.sql("""
+                update transfers
+                set status = :outcome,
+                    failure_reason = case when :outcome = 'FAILED' then :reason else failure_reason end,
+                    updated_at = now()
+                where id = :id and status in ('DISPATCHED', 'NEEDS_REVIEW')
+                """)
+                .param("outcome", outcome.name())
+                .param("reason", failureReason, Types.VARCHAR)
+                .param("id", id)
+                .update() == 1;
+    }
+
+    /** DISPATCHED to PENDING so the dispatcher sends it again. Only for a transfer the rail never received. */
+    public boolean requeue(UUID id) {
+        return db.sql("""
+                update transfers set status = 'PENDING', next_check_at = null, updated_at = now()
+                where id = :id and status = 'DISPATCHED' and rail_ref is null
+                """)
+                .param("id", id)
+                .update() == 1;
+    }
+
+    public boolean markNeedsReview(UUID id, String reason) {
+        return db.sql("""
+                update transfers set status = 'NEEDS_REVIEW', review_reason = :reason, next_check_at = null,
+                                     updated_at = now()
+                where id = :id and status = 'DISPATCHED'
+                """)
+                .param("reason", reason)
                 .param("id", id)
                 .update() == 1;
     }

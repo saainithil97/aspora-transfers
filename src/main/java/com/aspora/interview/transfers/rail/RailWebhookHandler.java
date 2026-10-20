@@ -44,22 +44,15 @@ public class RailWebhookHandler {
             Transfer transfer = transfers.findByRailRef(railRef)
                     .orElseThrow(() -> new ApiException(ErrorCode.NOT_FOUND, "no transfer with rail_ref " + railRef));
             partnerEvents.insert(transfer.id(), event, railRef, rawPayload);
-            // Only the delivery that moves the transfer out of DISPATCHED settles it. Rails redeliver, and with
-            // two instances two copies of one webhook can be in here at the same moment.
-            if (transfers.compareAndSetStatus(transfer.id(), TransferStatus.DISPATCHED, outcome)) {
-                if (outcome == TransferStatus.FAILED) {
-                    transferService.refund(transfer);
-                }
-                log.info("rail {} for transfer {} ({})", event, transfer.id(), railRef);
-                return;
-            }
-            TransferStatus current = transfers.find(transfer.id()).orElseThrow().status();
-            if (current == outcome) {
-                log.info("duplicate rail {} for transfer {} ({}), already applied", event, transfer.id(), railRef);
-            } else {
+            // Rails redeliver, a status lookup may have settled it already, and with two instances two copies
+            // of one webhook can be in here at the same moment. settle() lets exactly one of them apply it.
+            switch (transferService.settle(transfer.id(), outcome)) {
+                case APPLIED -> log.info("rail {} for transfer {} ({})", event, transfer.id(), railRef);
+                case ALREADY_APPLIED -> log.info("duplicate rail {} for transfer {} ({}), already applied",
+                        event, transfer.id(), railRef);
                 // The rail has told us two different things. Money is left as it is; the event is kept above.
-                log.error("rail {} for transfer {} ({}) conflicts with its status {}; not applied, needs review",
-                        event, transfer.id(), railRef, current);
+                case CONFLICT -> log.error("rail {} for transfer {} ({}) conflicts with its current status; "
+                        + "not applied, needs review", event, transfer.id(), railRef);
             }
         });
     }

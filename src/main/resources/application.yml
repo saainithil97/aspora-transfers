@@ -21,6 +21,15 @@ transfers:
     latency-ms: ${RAIL_LATENCY_MS:300}
     webhook-secret: ${RAIL_WEBHOOK_SECRET:rail-dev-secret}
     webhook-enabled: ${RAIL_WEBHOOK_ENABLED:true}
+    webhook-drop-rate: ${RAIL_WEBHOOK_DROP_RATE:0.02}
+    lookup-failure-rate: ${RAIL_LOOKUP_FAILURE_RATE:0.0}
+  reconcile:
+    interval-ms: ${RECONCILE_INTERVAL_MS:5000}
+    grace-ms: ${RECONCILE_GRACE_MS:30000}
+    retry-ms: ${RECONCILE_RETRY_MS:30000}
+    max-attempts: ${RECONCILE_MAX_ATTEMPTS:10}
+    max-resends: ${RECONCILE_MAX_RESENDS:3}
+    max-processing-ms: ${RECONCILE_MAX_PROCESSING_MS:86400000}
 
 logging:
   level:
